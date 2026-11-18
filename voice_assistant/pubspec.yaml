@@ -1,0 +1,23 @@
+name: voice_assistant
+description: "Voice Assistant Flutter project with BLE Control, Wi-Fi WebSocket PCM Audio Streaming, and Offline Whisper AI Speech Recognition (Bengali + English)."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_blue_plus: ^1.35.0
+  whisper_cpp_flutter_plus: ^0.5.1
+  permission_handler: ^11.3.1
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
