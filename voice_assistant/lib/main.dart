@@ -1150,23 +1150,33 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
                   style: FilledButton.styleFrom(
                     backgroundColor: isListening
                         ? Colors.redAccent
-                        : (anyConnected
-                            ? const Color(0xFF0D6EFD)
-                            : Colors.grey.shade400),
+                        : const Color(0xFF0D6EFD),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(12),
                     ),
                   ),
-                  onPressed: anyConnected && isEngineReady
-                      ? (isListening ? _stopListening : _startListening)
-                      : null,
+                  onPressed: () {
+                    if (isListening) {
+                      _stopListening();
+                      return;
+                    }
+                    if (!isEngineReady) {
+                      _showToast('Vosk Engine is still loading... Please wait.');
+                      return;
+                    }
+                    if (!anyConnected) {
+                      _showToast('Please connect Wi-Fi or Bluetooth first!');
+                      return;
+                    }
+                    _startListening();
+                  },
                   icon: Icon(isListening ? Icons.stop_circle : Icons.play_circle_fill),
                   label: Text(
                     isListening
                         ? 'STOP STREAMING / RECORDING'
                         : (anyConnected
                             ? 'START VOSK LISTENING'
-                            : 'CONNECT WI-FI OR BLE TO START'),
+                            : 'START LISTENING (Connect Wi-Fi / BLE)'),
                     style: const TextStyle(
                       fontWeight: FontWeight.bold,
                       fontSize: 14,
