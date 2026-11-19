@@ -163,14 +163,12 @@ class BanglishTranscriber {
     for (final word in words) {
       if (word.isEmpty) continue;
 
-      // Check dictionary match first
       final cleanWord = word.replaceAll(RegExp(r'[^\u0980-\u09FF]'), '');
       if (_phraseMap.containsKey(cleanWord)) {
         convertedWords.add(word.replaceAll(cleanWord, _phraseMap[cleanWord]!));
         continue;
       }
 
-      // Phonetic character-by-character translation
       final buffer = StringBuffer();
       final runes = word.runes.toList();
 
@@ -186,7 +184,6 @@ class BanglishTranscriber {
         } else if (_consonants.containsKey(char)) {
           buffer.write(_consonants[char]);
 
-          // Handle implicit vowel 'o' if next char is not a vowel sign or halant (্)
           if (i + 1 < runes.length) {
             final nextChar = String.fromCharCode(runes[i + 1]);
             if (!_vowelSigns.containsKey(nextChar) &&
@@ -196,7 +193,6 @@ class BanglishTranscriber {
             }
           }
         } else if (char == '্') {
-          // Halant suppresses inherent vowel
           continue;
         } else {
           buffer.write(char);
@@ -296,8 +292,6 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
   final VoskFlutterPlugin _vosk = VoskFlutterPlugin.instance();
   Model? _voskModel;
   Recognizer? _recognizer;
-  StreamSubscription? _voskResultSub;
-  StreamSubscription? _voskPartialSub;
   bool isEngineReady = false;
   bool isEngineLoading = false;
   String currentLanguage = 'en'; // 'en' or 'bn'
@@ -319,8 +313,6 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
   @override
   void dispose() {
     _disconnectAll();
-    _voskResultSub?.cancel();
-    _voskPartialSub?.cancel();
     _recognizer?.dispose();
     _voskModel?.dispose();
     super.dispose();
@@ -336,10 +328,8 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
     });
 
     try {
-      _voskResultSub?.cancel();
-      _voskPartialSub?.cancel();
       await _recognizer?.dispose();
-      await _voskModel?.dispose();
+      _voskModel?.dispose();
       _recognizer = null;
       _voskModel = null;
 
@@ -349,11 +339,10 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
 
       String? modelPath;
 
-      // 1. Check if model is bundled in assets
+      // 1. Check if model is bundled in assets, fallback to network
       try {
         modelPath = await ModelLoader().loadFromAssets(assetPath);
       } catch (_) {
-        // Not in assets, fallback to cached network load
         modelPath = await ModelLoader().loadFromNetwork(networkUrl);
       }
 
@@ -362,51 +351,6 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
         model: _voskModel!,
         sampleRate: 16000,
       );
-
-      // Listen for Live Partial Word-by-Word Results (Live Typing)
-      _voskPartialSub = _recognizer!.onPartial().listen((partialJson) {
-        try {
-          final Map<String, dynamic> data = jsonDecode(partialJson);
-          final partial = data['partial'] as String? ?? '';
-          if (mounted && partial.isNotEmpty) {
-            setState(() {
-              livePartialText = currentLanguage == 'bn'
-                  ? BanglishTranscriber.convert(partial)
-                  : partial;
-            });
-          }
-        } catch (_) {}
-      });
-
-      // Listen for Final Sentence Recognition
-      _voskResultSub = _recognizer!.onResult().listen((resultJson) {
-        try {
-          final Map<String, dynamic> data = jsonDecode(resultJson);
-          final text = (data['text'] as String? ?? '').trim();
-          if (mounted && text.isNotEmpty) {
-            String outputText = text;
-            bool isBanglish = false;
-
-            if (currentLanguage == 'bn' || BanglishTranscriber.containsBangla(text)) {
-              outputText = BanglishTranscriber.convert(text);
-              isBanglish = true;
-            }
-
-            setState(() {
-              livePartialText = '';
-              transcripts.insert(
-                0,
-                TranscriptItem(
-                  text: outputText,
-                  language: isBanglish ? 'Banglish' : 'English',
-                  timestamp: DateTime.now(),
-                  isBanglish: isBanglish,
-                ),
-              );
-            });
-          }
-        } catch (_) {}
-      });
 
       if (!mounted) return;
       setState(() {
@@ -432,6 +376,49 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
       currentLanguage = newLang;
     });
     _initVoskEngine();
+  }
+
+  void _handleVoskPartialJson(String partialJson) {
+    try {
+      final Map<String, dynamic> data = jsonDecode(partialJson);
+      final partial = (data['partial'] as String? ?? '').trim();
+      if (mounted && partial.isNotEmpty) {
+        setState(() {
+          livePartialText = currentLanguage == 'bn'
+              ? BanglishTranscriber.convert(partial)
+              : partial;
+        });
+      }
+    } catch (_) {}
+  }
+
+  void _handleVoskResultJson(String resultJson) {
+    try {
+      final Map<String, dynamic> data = jsonDecode(resultJson);
+      final text = (data['text'] as String? ?? '').trim();
+      if (mounted && text.isNotEmpty) {
+        String outputText = text;
+        bool isBanglish = false;
+
+        if (currentLanguage == 'bn' || BanglishTranscriber.containsBangla(text)) {
+          outputText = BanglishTranscriber.convert(text);
+          isBanglish = true;
+        }
+
+        setState(() {
+          livePartialText = '';
+          transcripts.insert(
+            0,
+            TranscriptItem(
+              text: outputText,
+              language: isBanglish ? 'Banglish' : 'English',
+              timestamp: DateTime.now(),
+              isBanglish: isBanglish,
+            ),
+          );
+        });
+      }
+    } catch (_) {}
   }
 
   // --------------------------------------------------------------------------
@@ -738,7 +725,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
     });
   }
 
-  void _feedAudioChunkToVosk(Uint8List pcmChunk) {
+  Future<void> _feedAudioChunkToVosk(Uint8List pcmChunk) async {
     if (!isListening || _recognizer == null) return;
 
     // Calculate RMS volume for visual meter
@@ -756,7 +743,16 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
     }
 
     // Direct Real-time Streaming into Vosk
-    _recognizer!.acceptWaveform(pcmChunk);
+    try {
+      final bool hasResult = await _recognizer!.acceptWaveformBytes(pcmChunk);
+      if (hasResult) {
+        final resultJson = await _recognizer!.getResult();
+        _handleVoskResultJson(resultJson);
+      } else {
+        final partialJson = await _recognizer!.getPartialResult();
+        _handleVoskPartialJson(partialJson);
+      }
+    } catch (_) {}
   }
 
   // --------------------------------------------------------------------------
@@ -945,9 +941,9 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
                 margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                 decoration: BoxDecoration(
-                  color: Colors.amber.withOpacity(0.15),
+                  color: Colors.amber.withAlpha(38),
                   borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: Colors.amber.withOpacity(0.4)),
+                  border: Border.all(color: Colors.amber.withAlpha(100)),
                 ),
                 child: Row(
                   children: [
@@ -980,7 +976,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
                   side: BorderSide(
                     color: isDark
                         ? const Color(0xFF334155)
-                        : Colors.grey.withOpacity(0.2),
+                        : Colors.grey.withAlpha(50),
                   ),
                 ),
                 child: Padding(
@@ -994,8 +990,8 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
                             decoration: BoxDecoration(
                               shape: BoxShape.circle,
                               color: isListening
-                                  ? Colors.red.withOpacity(0.15)
-                                  : theme.colorScheme.primary.withOpacity(0.1),
+                                  ? Colors.red.withAlpha(38)
+                                  : theme.colorScheme.primary.withAlpha(25),
                             ),
                             child: Icon(
                               isListening ? Icons.graphic_eq : Icons.mic_none,
@@ -1187,9 +1183,9 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
                 margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                 decoration: BoxDecoration(
-                  color: Colors.blue.withOpacity(0.12),
+                  color: Colors.blue.withAlpha(30),
                   borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: Colors.blue.withOpacity(0.3)),
+                  border: Border.all(color: Colors.blue.withAlpha(75)),
                 ),
                 child: Row(
                   children: [
@@ -1224,7 +1220,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                     decoration: BoxDecoration(
-                      color: Colors.blue.withOpacity(0.15),
+                      color: Colors.blue.withAlpha(38),
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: Text(
@@ -1290,7 +1286,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
                             border: Border.all(
                               color: isDark
                                   ? const Color(0xFF334155)
-                                  : Colors.grey.withOpacity(0.2),
+                                  : Colors.grey.withAlpha(50),
                             ),
                           ),
                           child: Column(
@@ -1303,8 +1299,8 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
                                         horizontal: 6, vertical: 2),
                                     decoration: BoxDecoration(
                                       color: item.isBanglish
-                                          ? Colors.orange.withOpacity(0.15)
-                                          : Colors.green.withOpacity(0.15),
+                                          ? Colors.orange.withAlpha(38)
+                                          : Colors.green.withAlpha(38),
                                       borderRadius: BorderRadius.circular(4),
                                     ),
                                     child: Text(
