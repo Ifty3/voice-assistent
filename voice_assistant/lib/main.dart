@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:collection';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
@@ -8,7 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:whisper_cpp_flutter_plus/whisper_cpp_flutter_plus.dart';
+import 'package:vosk_flutter/vosk_flutter.dart';
 
 // ============================================================================
 // CONSTANTS & PROTOCOL IDENTIFIERS
@@ -21,9 +21,15 @@ const String bleDeviceName = 'VoiceBox-CTRL';
 
 const String defaultEsp32Ip = '192.168.4.1';
 const int defaultEsp32Port = 81;
-const String whisperModelFilename = 'ggml-base.bin';
-const String whisperModelDownloadUrl =
-    'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin';
+
+// Lightweight Vosk Models (~40MB, 1/4 the size of Whisper)
+const String voskEnglishAsset = 'assets/models/vosk-model-small-en-us-0.15.zip';
+const String voskEnglishUrl =
+    'https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip';
+
+const String voskBanglaAsset = 'assets/models/vosk-model-small-streaming-bn.zip';
+const String voskBanglaUrl =
+    'https://alphacephei.com/vosk/models/vosk-model-small-streaming-bn.zip';
 
 // ============================================================================
 // PHONETIC BANGLA TO BANGLISH TRANSLITERATOR
@@ -79,7 +85,6 @@ class BanglishTranscriber {
     'থামো': 'thamo',
   };
 
-  // Unicode character map
   static final Map<String, String> _vowels = {
     'অ': 'o',
     'আ': 'a',
@@ -181,7 +186,7 @@ class BanglishTranscriber {
         } else if (_consonants.containsKey(char)) {
           buffer.write(_consonants[char]);
 
-          // Handle implicit vowel 'o' if next char is not a vowel sign or hasant (্)
+          // Handle implicit vowel 'o' if next char is not a vowel sign or halant (্)
           if (i + 1 < runes.length) {
             final nextChar = String.fromCharCode(runes[i + 1]);
             if (!_vowelSigns.containsKey(nextChar) &&
@@ -191,10 +196,9 @@ class BanglishTranscriber {
             }
           }
         } else if (char == '্') {
-          // Halant: suppress inherent vowel (already handled)
+          // Halant suppresses inherent vowel
           continue;
         } else {
-          // Keep punctuation or English letters as-is
           buffer.write(char);
         }
       }
@@ -237,7 +241,7 @@ class VoiceBoxApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'VoiceBox AI',
+      title: 'VoiceBox Vosk AI',
       themeMode: ThemeMode.system,
       theme: ThemeData(
         useMaterial3: true,
@@ -267,8 +271,7 @@ class VoiceHomeScreen extends StatefulWidget {
   State<VoiceHomeScreen> createState() => _VoiceHomeScreenState();
 }
 
-class _VoiceHomeScreenState extends State<VoiceHomeScreen>
-    with SingleTickerProviderStateMixin {
+class _VoiceHomeScreenState extends State<VoiceHomeScreen> {
   // Wi-Fi Configuration
   String espIp = defaultEsp32Ip;
   int espPort = defaultEsp32Port;
@@ -277,7 +280,6 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
   bool isWifiConnecting = false;
   bool isWifiConnected = false;
   int wifiBytesReceived = 0;
-  DateTime? _lastPacketTime;
 
   // BLE Configuration
   BluetoothDevice? _bleDevice;
@@ -290,128 +292,160 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
   bool isBleScanning = false;
   bool isBleConnected = false;
 
-  // AI & Speech Engine
-  final WhisperModelManager _modelManager = WhisperModelManager();
-  WhisperEngine? _engine;
-  bool isModelReady = false;
-  bool isModelDownloading = false;
-  double modelDownloadProgress = 0.0;
-  String recognitionLang = 'auto'; // 'auto', 'en', 'bn'
-  bool enableBanglishConversion = true;
+  // Vosk Engine
+  final VoskFlutterPlugin _vosk = VoskFlutterPlugin.instance();
+  Model? _voskModel;
+  Recognizer? _recognizer;
+  StreamSubscription? _voskResultSub;
+  StreamSubscription? _voskPartialSub;
+  bool isEngineReady = false;
+  bool isEngineLoading = false;
+  String currentLanguage = 'en'; // 'en' or 'bn'
+  String livePartialText = '';
 
-  // Audio Pipeline & VAD State
+  // Audio Pipeline
   bool isListening = false;
-  bool isProcessing = false;
   double currentAudioRms = 0.0;
-  final List<int> _incomingPcmChunkBuffer = [];
-  final List<int> _speechAudioBuffer = [];
-  final Queue<Uint8List> _preRollFrames = Queue();
-
-  bool _inSpeech = false;
-  int _silentFramesCount = 0;
-
-  static const int _frameBytes = 640; // 20ms @ 16kHz 16-bit mono
-  static const int _silenceLimit = 45; // ~900ms silence marks sentence boundary
-  static const double _vadThreshold = 550.0; // RMS energy gate
-
-  // Transcripts & UI
   final List<TranscriptItem> transcripts = [];
-  String statusMessage = 'Ready. Connect Wi-Fi or Bluetooth to start.';
+  String statusMessage = 'Vosk Offline Engine Initializing...';
   bool showMobileDataNotice = true;
 
   @override
   void initState() {
     super.initState();
-    _checkExistingAiModel();
+    _initVoskEngine();
   }
 
   @override
   void dispose() {
     _disconnectAll();
-    _engine?.dispose();
-    _modelManager.close();
+    _voskResultSub?.cancel();
+    _voskPartialSub?.cancel();
+    _recognizer?.dispose();
+    _voskModel?.dispose();
     super.dispose();
   }
 
   // --------------------------------------------------------------------------
-  // MODEL MANAGEMENT
+  // VOSK ENGINE SETUP & MODEL LOADING
   // --------------------------------------------------------------------------
-  Future<void> _checkExistingAiModel() async {
-    try {
-      final model = await _modelManager.find(whisperModelFilename);
-      if (model != null && mounted) {
-        final engine = await WhisperEngine.load(model.path);
-        if (!mounted) {
-          engine.dispose();
-          return;
-        }
-        setState(() {
-          _engine = engine;
-          isModelReady = true;
-          statusMessage = 'Offline AI Engine Ready (Multi-lingual)';
-        });
-      }
-    } catch (_) {}
-  }
-
-  Future<void> _downloadModel() async {
-    if (isModelDownloading) return;
+  Future<void> _initVoskEngine() async {
     setState(() {
-      isModelDownloading = true;
-      modelDownloadProgress = 0.01;
-      statusMessage = 'Connecting to model repository...';
+      isEngineLoading = true;
+      statusMessage = 'Loading Vosk Engine ($currentLanguage)...';
     });
 
     try {
-      final existing = await _modelManager.find(whisperModelFilename);
-      if (existing != null) {
-        _engine = await WhisperEngine.load(existing.path);
-      } else {
-        await for (final progress in _modelManager.download(
-          Uri.parse(whisperModelDownloadUrl),
-          whisperModelFilename,
-        )) {
-          if (!mounted) return;
-          setState(() {
-            modelDownloadProgress = progress.fraction;
-            statusMessage =
-                'Downloading Model: ${(progress.fraction * 100).toStringAsFixed(1)}%';
-          });
-        }
-        final model = await _modelManager.find(whisperModelFilename);
-        if (model == null) throw Exception('Model verification failed');
-        _engine = await WhisperEngine.load(model.path);
+      _voskResultSub?.cancel();
+      _voskPartialSub?.cancel();
+      await _recognizer?.dispose();
+      await _voskModel?.dispose();
+      _recognizer = null;
+      _voskModel = null;
+
+      final isBangla = currentLanguage == 'bn';
+      final assetPath = isBangla ? voskBanglaAsset : voskEnglishAsset;
+      final networkUrl = isBangla ? voskBanglaUrl : voskEnglishUrl;
+
+      String? modelPath;
+
+      // 1. Check if model is bundled in assets
+      try {
+        modelPath = await ModelLoader().loadFromAssets(assetPath);
+      } catch (_) {
+        // Not in assets, fallback to cached network load
+        modelPath = await ModelLoader().loadFromNetwork(networkUrl);
       }
+
+      _voskModel = await _vosk.createModel(modelPath);
+      _recognizer = await _vosk.createRecognizer(
+        model: _voskModel!,
+        sampleRate: 16000,
+      );
+
+      // Listen for Live Partial Word-by-Word Results (Live Typing)
+      _voskPartialSub = _recognizer!.onPartial().listen((partialJson) {
+        try {
+          final Map<String, dynamic> data = jsonDecode(partialJson);
+          final partial = data['partial'] as String? ?? '';
+          if (mounted && partial.isNotEmpty) {
+            setState(() {
+              livePartialText = currentLanguage == 'bn'
+                  ? BanglishTranscriber.convert(partial)
+                  : partial;
+            });
+          }
+        } catch (_) {}
+      });
+
+      // Listen for Final Sentence Recognition
+      _voskResultSub = _recognizer!.onResult().listen((resultJson) {
+        try {
+          final Map<String, dynamic> data = jsonDecode(resultJson);
+          final text = (data['text'] as String? ?? '').trim();
+          if (mounted && text.isNotEmpty) {
+            String outputText = text;
+            bool isBanglish = false;
+
+            if (currentLanguage == 'bn' || BanglishTranscriber.containsBangla(text)) {
+              outputText = BanglishTranscriber.convert(text);
+              isBanglish = true;
+            }
+
+            setState(() {
+              livePartialText = '';
+              transcripts.insert(
+                0,
+                TranscriptItem(
+                  text: outputText,
+                  language: isBanglish ? 'Banglish' : 'English',
+                  timestamp: DateTime.now(),
+                  isBanglish: isBanglish,
+                ),
+              );
+            });
+          }
+        } catch (_) {}
+      });
 
       if (!mounted) return;
       setState(() {
-        isModelReady = true;
-        isModelDownloading = false;
-        statusMessage = 'AI Engine Initialized Successfully';
+        isEngineReady = true;
+        isEngineLoading = false;
+        statusMessage =
+            'Vosk Engine Ready (${currentLanguage == 'en' ? 'English' : 'Bangla ➔ Banglish'})';
       });
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        isModelDownloading = false;
-        statusMessage = 'Model Error: $e';
+        isEngineLoading = false;
+        isEngineReady = false;
+        statusMessage = 'Vosk Load Error: $e';
       });
-      _showToast('Model download error: $e');
+      _showToast('Vosk Init Error: $e');
     }
   }
 
+  void _switchLanguage(String newLang) {
+    if (currentLanguage == newLang) return;
+    setState(() {
+      currentLanguage = newLang;
+    });
+    _initVoskEngine();
+  }
+
   // --------------------------------------------------------------------------
-  // ROBUST WI-FI WEBSOCKET CLIENT & DIAGNOSTICS
+  // WI-FI WEBSOCKET CLIENT & PRE-FLIGHT PROBE
   // --------------------------------------------------------------------------
   Future<void> _connectWifi() async {
     if (isWifiConnected || isWifiConnecting) return;
 
     setState(() {
       isWifiConnecting = true;
-      statusMessage = 'Probing TCP socket at $espIp:$espPort...';
+      statusMessage = 'Checking connection at $espIp:$espPort...';
     });
 
     try {
-      // Pre-flight check: Verify host and port reachability quickly (3s)
       Socket testSocket;
       try {
         testSocket = await Socket.connect(
@@ -420,22 +454,22 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
           timeout: const Duration(seconds: 4),
         );
         testSocket.destroy();
-      } catch (tcpError) {
+      } catch (_) {
         throw Exception(
           'Cannot reach $espIp:$espPort.\n'
           '1. Ensure phone Wi-Fi is connected to "VoiceBox".\n'
-          '2. Turn OFF Mobile Data (cellular) so Android does not block local traffic.',
+          '2. Turn OFF Mobile Data (cellular) so Android does not route to LTE/5G.',
         );
       }
 
       setState(() {
-        statusMessage = 'Opening WebSocket stream...';
+        statusMessage = 'Connecting WebSocket...';
       });
 
       final wsUrl = 'ws://$espIp:$espPort/';
       _socket = await WebSocket.connect(wsUrl).timeout(
         const Duration(seconds: 5),
-        onTimeout: () => throw TimeoutException('WebSocket handshake timed out at $wsUrl'),
+        onTimeout: () => throw TimeoutException('Handshake timeout at $wsUrl'),
       );
 
       _socket!.pingInterval = const Duration(seconds: 3);
@@ -445,8 +479,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
         (data) {
           if (data is List<int>) {
             wifiBytesReceived += data.length;
-            _lastPacketTime = DateTime.now();
-            _processAudioChunk(Uint8List.fromList(data));
+            _feedAudioChunkToVosk(Uint8List.fromList(data));
           } else if (data is String && mounted) {
             setState(() {
               statusMessage = 'ESP32 Status: $data';
@@ -457,7 +490,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
           if (!mounted) return;
           setState(() {
             isWifiConnected = false;
-            statusMessage = 'Wi-Fi Connection Error: $err';
+            statusMessage = 'Wi-Fi Socket Error: $err';
           });
         },
         onDone: () {
@@ -474,9 +507,9 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
       setState(() {
         isWifiConnected = true;
         isWifiConnecting = false;
-        statusMessage = 'Wi-Fi Streaming Connected ($espIp:$espPort)';
+        statusMessage = 'Wi-Fi Streaming Active ($espIp:$espPort)';
       });
-      _showToast('Connected to ESP32 over Wi-Fi!');
+      _showToast('Wi-Fi Connected successfully!');
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -484,7 +517,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
         isWifiConnected = false;
         statusMessage = 'Wi-Fi Failed: $e';
       });
-      _showErrorDialog('Wi-Fi Connection Failed', e.toString());
+      _showErrorDialog('Wi-Fi Connection Notice', e.toString());
     }
   }
 
@@ -508,7 +541,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
 
     setState(() {
       isBleScanning = true;
-      statusMessage = 'Scanning for Bluetooth device "$bleDeviceName"...';
+      statusMessage = 'Scanning for Bluetooth "$bleDeviceName"...';
     });
 
     try {
@@ -544,12 +577,12 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
           );
 
       await FlutterBluePlus.stopScan();
-      final matchedDevice = scanResult.firstWhere((r) =>
+      final matched = scanResult.firstWhere((r) =>
           r.advertisementData.advName == bleDeviceName ||
           r.device.platformName == bleDeviceName ||
           r.advertisementData.serviceUuids.contains(Guid(bleServiceUuid)));
 
-      _bleDevice = matchedDevice.device;
+      _bleDevice = matched.device;
 
       setState(() {
         statusMessage = 'Pairing with ${_bleDevice!.platformName}...';
@@ -614,7 +647,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
         _bleAudioSub?.cancel();
         _bleAudioSub = _audioChar!.onValueReceived.listen((bytes) {
           if (!isWifiConnected && bytes.isNotEmpty) {
-            _processAudioChunk(Uint8List.fromList(bytes));
+            _feedAudioChunkToVosk(Uint8List.fromList(bytes));
           }
         });
       }
@@ -625,7 +658,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
         isBleScanning = false;
         statusMessage = 'Bluetooth Connected & Ready';
       });
-      _showToast('Connected to ESP32 via Bluetooth!');
+      _showToast('Bluetooth Connected!');
     } catch (e) {
       try {
         await FlutterBluePlus.stopScan();
@@ -660,12 +693,12 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
     _disconnectBle();
     setState(() {
       isListening = false;
-      statusMessage = 'All Transports Disconnected';
+      statusMessage = 'All Disconnected';
     });
   }
 
   // --------------------------------------------------------------------------
-  // AUDIO SAMPLING & VOICE ACTIVITY DETECTION (VAD)
+  // LIVE VOSK AUDIO FEEDING (REAL-TIME STREAMING)
   // --------------------------------------------------------------------------
   Future<void> _sendDeviceCommand(String cmd) async {
     try {
@@ -677,8 +710,8 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
   }
 
   Future<void> _startListening() async {
-    if (!isModelReady) {
-      _showToast('Please download the AI Model first.');
+    if (!isEngineReady) {
+      _showToast('Vosk engine is still initializing...');
       return;
     }
     if (!isWifiConnected && !isBleConnected) {
@@ -686,17 +719,12 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
       return;
     }
 
-    _incomingPcmChunkBuffer.clear();
-    _speechAudioBuffer.clear();
-    _preRollFrames.clear();
-    _inSpeech = false;
-    _silentFramesCount = 0;
-
     await _sendDeviceCommand('START');
 
     setState(() {
       isListening = true;
-      statusMessage = 'Listening for speech from ESP32 mic...';
+      livePartialText = '';
+      statusMessage = 'Live streaming mic data into Vosk Engine...';
     });
   }
 
@@ -705,178 +733,30 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
     setState(() {
       isListening = false;
       currentAudioRms = 0.0;
-      statusMessage = 'Stopped listening.';
+      livePartialText = '';
+      statusMessage = 'Listening stopped';
     });
   }
 
-  void _processAudioChunk(Uint8List chunk) {
-    if (!isListening || isProcessing) return;
+  void _feedAudioChunkToVosk(Uint8List pcmChunk) {
+    if (!isListening || _recognizer == null) return;
 
-    _incomingPcmChunkBuffer.addAll(chunk);
-
-    if (_incomingPcmChunkBuffer.length > 64000) {
-      _incomingPcmChunkBuffer.clear();
-      return;
-    }
-
-    while (_incomingPcmChunkBuffer.length >= _frameBytes) {
-      final frame = Uint8List.fromList(
-        _incomingPcmChunkBuffer.sublist(0, _frameBytes),
-      );
-      _incomingPcmChunkBuffer.removeRange(0, _frameBytes);
-      _evaluateFrameVad(frame);
-    }
-  }
-
-  void _evaluateFrameVad(Uint8List frame) {
-    final byteData = ByteData.sublistView(frame);
-    double energySum = 0;
-
-    for (int i = 0; i < frame.length; i += 2) {
+    // Calculate RMS volume for visual meter
+    final byteData = ByteData.sublistView(pcmChunk);
+    double energy = 0;
+    for (int i = 0; i < pcmChunk.length; i += 2) {
       final sample = byteData.getInt16(i, Endian.little);
-      energySum += sample * sample;
+      energy += sample * sample;
     }
-
-    final double rms = sqrt(energySum / (frame.length ~/ 2));
-
-    // Update real-time RMS meter for visualizer
-    if (mounted && (rms - currentAudioRms).abs() > 30) {
+    final double rms = sqrt(energy / (pcmChunk.length ~/ 2));
+    if (mounted && (rms - currentAudioRms).abs() > 25) {
       setState(() {
         currentAudioRms = rms;
       });
     }
 
-    final bool isVoice = rms > _vadThreshold;
-
-    _preRollFrames.add(frame);
-    if (_preRollFrames.length > 10) {
-      _preRollFrames.removeFirst();
-    }
-
-    if (isVoice) {
-      if (!_inSpeech) {
-        _inSpeech = true;
-        for (final old in _preRollFrames) {
-          _speechAudioBuffer.addAll(old);
-        }
-      } else {
-        _speechAudioBuffer.addAll(frame);
-      }
-      _silentFramesCount = 0;
-    } else if (_inSpeech) {
-      _speechAudioBuffer.addAll(frame);
-      _silentFramesCount++;
-
-      if (_silentFramesCount >= _silenceLimit) {
-        _inSpeech = false;
-        _silentFramesCount = 0;
-        _preRollFrames.clear();
-        unawaited(_transcribeSpeechBuffer());
-      }
-    }
-  }
-
-  Uint8List _buildWavHeader(List<int> pcmData) {
-    final header = ByteData(44);
-
-    void writeString(int offset, String str) {
-      for (int i = 0; i < str.length; i++) {
-        header.setUint8(offset + i, str.codeUnitAt(i));
-      }
-    }
-
-    writeString(0, 'RIFF');
-    header.setUint32(4, pcmData.length + 36, Endian.little);
-    writeString(8, 'WAVE');
-    writeString(12, 'fmt ');
-    header.setUint32(16, 16, Endian.little);
-    header.setUint16(20, 1, Endian.little); // PCM Format
-    header.setUint16(22, 1, Endian.little); // 1 Channel Mono
-    header.setUint32(24, 16000, Endian.little); // 16kHz
-    header.setUint32(28, 32000, Endian.little); // Byte rate (16000 * 2)
-    header.setUint16(32, 2, Endian.little); // Block align
-    header.setUint16(34, 16, Endian.little); // 16 bits per sample
-    writeString(36, 'data');
-    header.setUint32(40, pcmData.length, Endian.little);
-
-    final wav = Uint8List(44 + pcmData.length);
-    wav.setRange(0, 44, header.buffer.asUint8List());
-    wav.setRange(44, 44 + pcmData.length, pcmData);
-    return wav;
-  }
-
-  Future<void> _transcribeSpeechBuffer() async {
-    if (_speechAudioBuffer.isEmpty || isProcessing || _engine == null) return;
-
-    isProcessing = true;
-    final pcmSamples = List<int>.from(_speechAudioBuffer);
-    _speechAudioBuffer.clear();
-
-    // Discard noise clicks < 350ms
-    if (pcmSamples.length < 11200) {
-      isProcessing = false;
-      return;
-    }
-
-    if (!mounted) {
-      isProcessing = false;
-      return;
-    }
-
-    setState(() {
-      statusMessage = 'Transcribing speech with on-device AI...';
-    });
-
-    try {
-      final wavBytes = _buildWavHeader(pcmSamples);
-      final Float32List floatAudio = WhisperAudio.decodeWav(wavBytes);
-
-      final task = _engine!.transcribe(
-        floatAudio,
-        options: TranscribeOptions(
-          language: recognitionLang,
-        ).withPerformanceMode(WhisperPerformanceMode.efficient),
-      );
-
-      final result = await task.result;
-      if (!mounted) return;
-
-      final rawText = result.text.trim();
-      if (rawText.isNotEmpty) {
-        String displayText = rawText;
-        bool isBanglish = false;
-
-        // Automatically convert to Banglish if Bengali characters are present
-        if (enableBanglishConversion && BanglishTranscriber.containsBangla(rawText)) {
-          displayText = BanglishTranscriber.convert(rawText);
-          isBanglish = true;
-        }
-
-        setState(() {
-          transcripts.insert(
-            0,
-            TranscriptItem(
-              text: displayText,
-              language: isBanglish ? 'Banglish' : 'English',
-              timestamp: DateTime.now(),
-              isBanglish: isBanglish,
-            ),
-          );
-        });
-      }
-
-      setState(() {
-        statusMessage = isListening ? 'Listening...' : 'Transcribe completed';
-      });
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          statusMessage = 'Recognition Error: $e';
-        });
-      }
-    } finally {
-      isProcessing = false;
-    }
+    // Direct Real-time Streaming into Vosk
+    _recognizer!.acceptWaveform(pcmChunk);
   }
 
   // --------------------------------------------------------------------------
@@ -976,7 +856,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
                   },
                 ),
                 ActionChip(
-                  label: const Text('Local Router Preset'),
+                  label: const Text('Home Router Preset'),
                   onPressed: () {
                     ipController.text = '192.168.1.100';
                     portController.text = '81';
@@ -1004,7 +884,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
   }
 
   // --------------------------------------------------------------------------
-  // BUILD METHOD & INTERFACE
+  // MAIN BUILD
   // --------------------------------------------------------------------------
   @override
   Widget build(BuildContext context) {
@@ -1018,7 +898,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'VoiceBox Edge-AI',
+              'VoiceBox (Vosk Engine)',
               style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
             ),
             Text(
@@ -1040,20 +920,16 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
           ),
           PopupMenuButton<String>(
             tooltip: 'Language Mode',
-            initialValue: recognitionLang,
-            onSelected: (val) => setState(() => recognitionLang = val),
+            initialValue: currentLanguage,
+            onSelected: _switchLanguage,
             itemBuilder: (ctx) => [
               const PopupMenuItem(
-                value: 'auto',
-                child: Text('Auto Detect (English + Bangla)'),
-              ),
-              const PopupMenuItem(
                 value: 'en',
-                child: Text('English Only'),
+                child: Text('English (Vosk English)'),
               ),
               const PopupMenuItem(
                 value: 'bn',
-                child: Text('Bangla ➔ Banglish Mode'),
+                child: Text('Bangla ➔ Banglish (Vosk Bengali)'),
               ),
             ],
             icon: const Icon(Icons.translate),
@@ -1079,7 +955,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
                     const SizedBox(width: 10),
                     Expanded(
                       child: Text(
-                        'Tip: If connecting to "VoiceBox" Wi-Fi, turn off Mobile Data so Android doesn\'t block local traffic.',
+                        'Tip: If connecting to "VoiceBox" Wi-Fi, turn off Mobile Data so Android does not block local socket traffic.',
                         style: theme.textTheme.bodySmall?.copyWith(fontSize: 11),
                       ),
                     ),
@@ -1135,7 +1011,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Text(
-                                  isListening ? 'Streaming & Listening' : 'Device Idle',
+                                  isListening ? 'Streaming & Live Typing' : 'Device Idle',
                                   style: theme.textTheme.titleMedium?.copyWith(
                                     fontWeight: FontWeight.bold,
                                   ),
@@ -1155,7 +1031,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
                         ],
                       ),
 
-                      // Audio Energy Meter (VU level)
+                      // Audio VU Meter
                       if (isListening) ...[
                         const SizedBox(height: 14),
                         Row(
@@ -1176,7 +1052,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
                                       ? Colors.grey.shade800
                                       : Colors.grey.shade200,
                                   valueColor: AlwaysStoppedAnimation(
-                                    currentAudioRms > _vadThreshold
+                                    currentAudioRms > 550
                                         ? Colors.greenAccent
                                         : Colors.blueAccent,
                                   ),
@@ -1204,9 +1080,9 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
                             icon: Icons.bluetooth,
                           ),
                           _buildChipBadge(
-                            label: 'Whisper AI',
-                            active: isModelReady,
-                            icon: Icons.smart_toy_outlined,
+                            label: 'Vosk Engine',
+                            active: isEngineReady,
+                            icon: Icons.memory,
                           ),
                         ],
                       ),
@@ -1268,28 +1144,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
               ),
             ),
 
-            // Model Download if not ready
-            if (!isModelReady)
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                child: FilledButton.tonalIcon(
-                  style: FilledButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                  ),
-                  onPressed: isModelDownloading ? null : _downloadModel,
-                  icon: const Icon(Icons.download_for_offline),
-                  label: Text(
-                    isModelDownloading
-                        ? 'Downloading (${(modelDownloadProgress * 100).toStringAsFixed(0)}%)'
-                        : 'Download AI Model (Offline Engine)',
-                  ),
-                ),
-              ),
-
-            // Start / Stop Microphone Button
+            // Start / Stop Listening Button
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
               child: SizedBox(
@@ -1306,7 +1161,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
                       borderRadius: BorderRadius.circular(12),
                     ),
                   ),
-                  onPressed: anyConnected && isModelReady
+                  onPressed: anyConnected && isEngineReady
                       ? (isListening ? _stopListening : _startListening)
                       : null,
                   icon: Icon(isListening ? Icons.stop_circle : Icons.play_circle_fill),
@@ -1314,7 +1169,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
                     isListening
                         ? 'STOP STREAMING / RECORDING'
                         : (anyConnected
-                            ? 'START LISTENING (ESP32 MIC)'
+                            ? 'START VOSK LISTENING'
                             : 'CONNECT WI-FI OR BLE TO START'),
                     style: const TextStyle(
                       fontWeight: FontWeight.bold,
@@ -1325,6 +1180,36 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
                 ),
               ),
             ),
+
+            // Live Partial Typing Bubble
+            if (livePartialText.isNotEmpty)
+              Container(
+                margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.blue.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.blue.withOpacity(0.3)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.record_voice_over,
+                        color: Colors.blueAccent, size: 18),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        livePartialText,
+                        style: const TextStyle(
+                          fontSize: 14,
+                          fontStyle: FontStyle.italic,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.blueAccent,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
 
             // Transcripts Header & Actions
             Padding(
@@ -1343,7 +1228,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: Text(
-                      enableBanglishConversion ? 'Banglish Auto-Convert' : 'Bangla Script',
+                      currentLanguage == 'bn' ? 'Banglish Output' : 'English Output',
                       style: const TextStyle(fontSize: 11, color: Colors.blueAccent),
                     ),
                   ),
@@ -1378,7 +1263,7 @@ class _VoiceHomeScreenState extends State<VoiceHomeScreen>
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            'Speak into ESP32 mic. English will print in English,\nBangla will automatically convert to Banglish!',
+                            'Powered by Vosk Offline Engine.\nAudio from ESP32 is processed in real time!',
                             textAlign: TextAlign.center,
                             style: TextStyle(
                               color: Colors.grey.shade500,
