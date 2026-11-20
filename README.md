@@ -1,6 +1,6 @@
 # Voice Assistant (ESP32-C3 Firmware + Flutter App)
 
-An end-to-end Edge AI voice assistant ecosystem featuring an **ESP32-C3 Super Mini** IoT microphone node and a cross-platform **Flutter** companion app with on-device speech-to-text (Whisper AI).
+An end-to-end edge AI offline voice assistant ecosystem featuring an **ESP32-C3 Super Mini** IoT microphone node and a cross-platform **Flutter** companion app powered by the **Vosk Offline Speech Engine** with real-time **English & Banglish** output.
 
 ---
 
@@ -11,10 +11,11 @@ An end-to-end Edge AI voice assistant ecosystem featuring an **ESP32-C3 Super Mi
 ├── esp32_firmware/
 │   └── voicebox_esp32_c3.ino          # Dual-transport (BLE & Wi-Fi WebSocket) ESP32-C3 audio streaming firmware
 ├── voice_assistant/                   # Flutter Application
-│   ├── android/                       # Native Android setup (NDK, Permissions, MinSdk 24)
+│   ├── android/                       # Native Android setup (Gradle 8.7, AGP 8.6, Proguard, MultiDex)
+│   ├── assets/models/                 # Bundled Vosk offline models (~40MB small-en-us)
 │   ├── lib/
-│   │   └── main.dart                  # Flutter app UI & logic (BLE, WebSocket, VAD, Whisper STT)
-│   ├── pubspec.yaml                   # Flutter dependencies
+│   │   └── main.dart                  # Flutter app UI & logic (BLE, WebSocket, Vosk Engine, Banglish transliteration)
+│   ├── pubspec.yaml                   # Flutter dependencies (vosk_flutter, flutter_blue_plus, etc.)
 │   ├── analysis_options.yaml
 │   └── README.md
 ├── .gitignore
@@ -25,18 +26,27 @@ An end-to-end Edge AI voice assistant ecosystem featuring an **ESP32-C3 Super Mi
 
 ## ⚡ System Architecture & Components
 
+```
+ [ESP32-C3 Node + Mic]
+   ├── BLE Server ("VoiceBox-CTRL") ─── Command State & Control ───> [Flutter App]
+   └── Wi-Fi AP ("VoiceBox", ws://:81) ─ Raw 16kHz PCM Audio Stream ─> [Vosk Engine] ──> [Banglish Converter] ──> [UI]
+```
+
 ### 1. ESP32-C3 Firmware (`esp32_firmware/`)
 - **Microcontroller:** ESP32-C3 Super Mini (RISC-V single-core).
 - **Microphone Input:** Pin 0 (ADC1 Channel 0). ADC1 is safe to sample while Wi-Fi is active.
 - **Dual Transport:**
   - **Wi-Fi WebSocket Server:** Runs on port `81` (`ws://192.168.4.1:81/`). SoftAP SSID: `VoiceBox`, Password: `voice1234`. Transmits raw 16kHz 16-bit mono PCM chunks (20ms / 640 bytes).
-  - **Bluetooth Low Energy (BLE):** Controls microphone state (Start/Stop streaming) and status telemetry.
+  - **Bluetooth Low Energy (BLE):** Controls microphone state (Start/Stop streaming) and status telemetry. Advertised device name: `VoiceBox-CTRL`.
 
-### 2. Flutter Mobile App (`voice_assistant/`)
-- **BLE Connection & Commands:** Scans for `VoiceBox` BLE service to start/stop the microphone.
-- **WebSocket Streaming:** Connects to `ws://192.168.4.1:81/` to stream incoming PCM audio in real-time.
-- **Voice Activity Detection (VAD):** Calculates frame energy to detect when speech starts and ends.
-- **On-Device Whisper AI:** Transcribes spoken audio locally using `whisper.cpp` without needing external cloud APIs. Supports multilingual models (Bengali & English).
+### 2. Flutter Companion App (`voice_assistant/`)
+- **Vosk Offline Engine:** High-performance, lightweight on-device speech recognition without cloud API dependency.
+  - Bundled with `vosk-model-small-en-us-0.15` (~40MB) directly in APK assets.
+  - Supports streaming recognition as audio chunks arrive from ESP32.
+- **Banglish Transliteration Engine:** Built-in phonetic converter that detects Bengali Unicode text and automatically transliterates it into natural Romanized **Banglish** in real time; English text remains untouched.
+- **Pre-flight Socket Diagnostics:** Tests raw TCP socket connectivity (`Socket.connect`) before initiating WebSocket handshake, with detailed error reporting.
+- **Customizable Network Endpoints:** In-app modal sheet to switch between ESP32 AP mode (`192.168.4.1:81`) or home router LAN IPs.
+- **Modern Dark UI:** Includes live VU audio level meter, transport status chips (Wi-Fi, BLE, Vosk), interactive partial transcript bubble, and 1-tap copy cards.
 
 ---
 
@@ -64,17 +74,19 @@ An end-to-end Edge AI voice assistant ecosystem featuring an **ESP32-C3 Super Mi
    ```
 3. Run or Build the Release APK:
    ```bash
-   flutter build apk --release --no-tree-shake-icons
+   flutter build apk --release --no-tree-shake-icons --android-skip-build-dependency-validation
    ```
+   Built APK location: `voice_assistant/build/app/outputs/flutter-apk/app-release.apk`
 
 ---
 
-## 🔄 End-to-End Workflow (Connecting ESP32 + Mobile App)
+## 🔄 End-to-End Workflow
 
-1. **Power up the ESP32-C3:** It starts the `VoiceBox` Wi-Fi Access Point (`SSID: VoiceBox`, `Password: voice1234`) and advertises over BLE.
+1. **Power up the ESP32-C3:** It starts the `VoiceBox` Wi-Fi Access Point (`SSID: VoiceBox`, `Password: voice1234`) and advertises over BLE (`VoiceBox-CTRL`).
 2. **Connect Phone to Wi-Fi:** On your Android phone, connect to Wi-Fi `VoiceBox`.
+   > **Note:** If Android prompts "No Internet Access", choose **Stay Connected**. It is recommended to temporarily disable Mobile Data (LTE/5G) so Android routes socket traffic to the ESP32 local network.
 3. **Open Flutter App:**
    - Grant Bluetooth and Nearby Devices permissions.
+   - Tap **Connect Wi-Fi** (or configure custom IP/Port via the Wi-Fi icon).
    - Tap **Scan & Connect BLE** to pair with the ESP32 node.
-   - Tap **Start Recording**; the app sends a BLE command to trigger the microphone and receives raw audio via WebSocket (`ws://192.168.4.1:81/`).
-   - When speaking stops, the app's VAD triggers transcription via Whisper AI and displays the output text on screen.
+   - Tap **Start Vosk Listening**; the app starts streaming audio directly into Vosk and prints live transcripts in English or Banglish.
